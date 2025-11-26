@@ -1,0 +1,192 @@
+// nvidia_installer.sorcat
+// ORCat single-file NVIDIA installer + bootloader config + pacman hook
+// Uses sb_create / write_file / system / input / free_str from your std libs.
+
+import C_types;
+import C_io;
+import C_fileio;
+import std;
+
+pub fn main() <int> {
+    install_nvidia_flow();
+    return 0;
+}
+
+pub fn install_nvidia_flow() <void> {
+    string res;
+
+    print("\nNVIDIA installer for Arch/Manjaro (ORCat wrapper)\n"); newline();
+
+    // Step 1: install linux-headers
+    print("[STEP] Installing linux-headers (sudo pacman -S linux-headers)..."); newline();
+    int rc = system("sudo pacman -S --noconfirm linux-headers");
+    if (rc != 0) {
+        print("[ERROR] linux-headers installation failed (non-zero exit). Aborting."); newline();
+        return;
+    }
+    print("[OK] linux-headers installed."); newline();
+
+    // Step 2: install NVIDIA packages
+    print("[STEP] Installing NVIDIA packages (this may ask for sudo password)..."); newline();
+    string pkgs = "sudo pacman -S --noconfirm nvidia-dkms libglvnd nvidia-utils opencl-nvidia lib32-libglvnd lib32-nvidia-utils lib32-opencl-nvidia nvidia-settings";
+    rc = system(pkgs);
+    if (rc != 0) {
+        print("[ERROR] NVIDIA package installation failed (non-zero exit). Aborting."); newline();
+        return;
+    }
+    print("[OK] NVIDIA packages installed."); newline();
+
+    // Build scripts
+    string grub_script = build_grub_script();
+    if (!write_file("configure_grub.sh", grub_script)) {
+        print("[ERROR] Failed to write configure_grub.sh"); newline();
+        free_str(grub_script);
+        return;
+    }
+    free_str(grub_script);
+    system("chmod +x configure_grub.sh");
+
+    string systemd_script = build_systemd_script();
+    if (!write_file("configure_systemd.sh", systemd_script)) {
+        print("[ERROR] Failed to write configure_systemd.sh"); newline();
+        free_str(systemd_script);
+        return;
+    }
+    free_str(systemd_script);
+    system("chmod +x configure_systemd.sh");
+
+    // Ask user for bootloader choice
+    print("\nWhich bootloader do you use?"); newline();
+    print("  1) GRUB"); newline();
+    print("  2) systemd-boot"); newline();
+    print("  3) Best-effort auto-detect"); newline();
+    res = input(empty() + "Enter 1, 2, or 3: "); newline();
+
+    string choice = tal(res);
+
+    if (streq(choice, "1")) {
+        print("[CHOICE] Running GRUB configuration script..."); newline();
+        rc = system("sudo ./configure_grub.sh");
+        if (rc != 0) { print("[WARN] configure_grub.sh returned non-zero."); newline(); }
+    } else if (streq(choice, "2")) {
+        print("[CHOICE] Running systemd-boot configuration script..."); newline();
+        rc = system("sudo ./configure_systemd.sh");
+        if (rc != 0) { print("[WARN] configure_systemd.sh returned non-zero."); newline(); }
+    } else {
+        // Best-effort autodetection
+        print("[AUTO] Attempting to auto-detect bootloader..."); newline();
+        // Check systemd-boot via bootctl
+        int detect_systemd = system("bootctl is-installed >/dev/null 2>&1");
+        int detect_grub = system("command -v grub-mkconfig >/dev/null 2>&1 && [ -f /etc/default/grub ]");
+        if (detect_systemd == 0) {
+            print("[AUTO] systemd-boot detected; running systemd script..."); newline();
+            rc = system("sudo ./configure_systemd.sh");
+            if (rc != 0) { print("[WARN] configure_systemd.sh returned non-zero."); newline(); }
+        } else if (detect_grub == 0) {
+            print("[AUTO] GRUB detected; running grub script..."); newline();
+            rc = system("sudo ./configure_grub.sh");
+            if (rc != 0) { print("[WARN] configure_grub.sh returned non-zero."); newline(); }
+        } else {
+            print("[AUTO] Couldn't detect a specific loader; attempting both (GRUB then systemd-boot) as best-effort."); newline();
+            rc = system("sudo ./configure_grub.sh");
+            if (rc != 0) { print("[WARN] configure_grub.sh returned non-zero."); newline(); }
+            rc = system("sudo ./configure_systemd.sh");
+            if (rc != 0) { print("[WARN] configure_systemd.sh returned non-zero."); newline(); }
+        }
+    }
+
+    // Step: create pacman hooks dir and install hook
+    print("[STEP] Creating /etc/pacman.d/hooks and installing nvidia.hook..."); newline();
+    system("sudo mkdir -p /etc/pacman.d/hooks");
+
+    string hook = build_nvidia_hook();
+    if (!write_file("nvidia.hook", hook)) {
+        print("[ERROR] Failed to write temporary nvidia.hook"); newline();
+        free_str(hook);
+        return;
+    }
+    free_str(hook);
+
+    // Move into /etc/pacman.d/hooks with sudo
+    int mv_rc = system("sudo mv nvidia.hook /etc/pacman.d/hooks/nvidia.hook");
+    if (mv_rc != 0) {
+        print("[ERROR] Could not move nvidia.hook into /etc/pacman.d/hooks (sudo mv failed)."); newline();
+        print("You can manually move the local nvidia.hook into /etc/pacman.d/hooks"); newline();
+    } else {
+        print("[OK] Installed /etc/pacman.d/hooks/nvidia.hook"); newline();
+    }
+
+    // Final: reboot prompt
+    string reboot_ans = input(empty() + "A reboot might be required. Reboot now? (y/N): "); newline();
+    string rb = tal(reboot_ans);
+    if (streq(rb, "y") || streq(rb, "yes")) {
+        print("Rebooting now..."); newline();
+        system("sudo reboot");
+    } else {
+        print("Reboot skipped. You may want to reboot later to complete NVIDIA setup."); newline();
+    }
+
+    print("[DONE] NVIDIA configuration flow finished."); newline();
+}
+
+// Helper: build grub script string
+pub fn build_grub_script() <string> {
+    string sb = sb_create();
+    sb = sb_append_str(sb, "#!/usr/bin/env bash\n\n");
+    sb = sb_append_str(sb, "# --- GRUB: Enable NVIDIA KMS -----------------------------------------\n");
+    sb = sb_append_str(sb, "if command -v grub-mkconfig >/dev/null && [ -f /etc/default/grub ]; then\n");
+    sb = sb_append_str(sb, "    echo \"[NVIDIA] Configuring GRUB…\"\n\n");
+    sb = sb_append_str(sb, "    # Backup\n");
+    sb = sb_append_str(sb, "    sudo cp /etc/default/grub /etc/default/grub.bak\n\n");
+    sb = sb_append_str(sb, "    # Remove existing modeset flag if present\n");
+    sb = sb_append_str(sb, "    current=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | cut -d'\"' -f2)\n");
+    sb = sb_append_str(sb, "    cleaned=$(echo \"$current\" | sed 's/\\bnvidia_drm.modeset=[^ ]*\\b//g')\n\n");
+    sb = sb_append_str(sb, "    # Apply updated line\n");
+    sb = sb_append_str(sb, "    sudo sed -i \"/^GRUB_CMDLINE_LINUX_DEFAULT=/c\\\n");
+    sb = sb_append_str(sb, "GRUB_CMDLINE_LINUX_DEFAULT=\\\"${cleaned} nvidia_drm.modeset=1\\\"\" \\\n");
+    sb = sb_append_str(sb, "        /etc/default/grub\n\n");
+    sb = sb_append_str(sb, "    # Regenerate config\n");
+    sb = sb_append_str(sb, "    sudo grub-mkconfig -o /boot/grub/grub.cfg\n");
+    sb = sb_append_str(sb, "fi\n");
+    string out = sb_finish(sb);
+    return out;
+}
+
+// Helper: build systemd-boot script string
+pub fn build_systemd_script() <string> {
+    string sb = sb_create();
+    sb = sb_append_str(sb, "#!/usr/bin/env bash\n\n");
+    sb = sb_append_str(sb, "# --- systemd-boot: Enable NVIDIA KMS ---------------------------------\n");
+    sb = sb_append_str(sb, "if bootctl is-installed >/dev/null 2>&1; then\n");
+    sb = sb_append_str(sb, "    if [[ \"$(bootctl status | awk '/Product:/ {print $2}')\" == \"systemd-boot\" ]]; then\n");
+    sb = sb_append_str(sb, "        echo \"[NVIDIA] Configuring systemd-boot…\"\n\n");
+    sb = sb_append_str(sb, "        for entry in /boot/loader/entries/*.conf; do\n");
+    sb = sb_append_str(sb, "            [ -f \"$entry\" ] || continue\n\n");
+    sb = sb_append_str(sb, "            sudo cp \"$entry\" \"$entry.bak\"\n\n");
+    sb = sb_append_str(sb, "            opts=$(grep \"^options\" \"$entry\" \\\n");
+    sb = sb_append_str(sb, "                    | sed 's/\\bquiet\\b//g; s/\\bsplash\\b//g; s/\\bnvidia_drm.modeset=[^ ]*\\b//g')\n\n");
+    sb = sb_append_str(sb, "            sudo sed -i \"/^options/c\\\n");
+    sb = sb_append_str(sb, "${opts} quiet splash nvidia_drm.modeset=1\" \"$entry\"\n");
+    sb = sb_append_str(sb, "        done\n");
+    sb = sb_append_str(sb, "    fi\n");
+    sb = sb_append_str(sb, "fi\n");
+    string out = sb_finish(sb);
+    return out;
+}
+
+// Helper: build nvidia pacman hook contents
+pub fn build_nvidia_hook() <string> {
+    string sb = sb_create();
+    sb = sb_append_str(sb, "[Trigger]\n");
+    sb = sb_append_str(sb, "Operation = Install\n");
+    sb = sb_append_str(sb, "Operation = Upgrade\n");
+    sb = sb_append_str(sb, "Operation = Remove\n");
+    sb = sb_append_str(sb, "Type = Package\n");
+    sb = sb_append_str(sb, "Target = nvidia\n\n");
+    sb = sb_append_str(sb, "[Action]\n");
+    sb = sb_append_str(sb, "Depends = mkinitcpio\n");
+    sb = sb_append_str(sb, "When = PostTransaction\n");
+    sb = sb_append_str(sb, "Exec = /usr/bin/mkinitcpio -P\n");
+    string out = sb_finish(sb);
+    return out;
+}
