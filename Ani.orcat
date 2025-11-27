@@ -1,7 +1,3 @@
-// nvidia_installer.sorcat
-// ORCat single-file NVIDIA installer + bootloader config + pacman hook
-// Uses sb_create / write_file / system / input / free_str from your std libs.
-
 import C_types;
 import C_io;
 import C_fileio;
